@@ -20,13 +20,17 @@ import (
 // rather than fetching the package from its origin repeatedly. There is
 // no way to reset this cache, so a particular PackageFetcher instance should
 // live only for the duration of a single initialization process.
+//
+// PackageFetcher is safe for concurrent use: FetchPackage may be called from
+// multiple goroutines downloading different packages at once, and the
+// in-process cache of previously-fetched packages is protected internally.
 type PackageFetcher struct {
-	getter reusingGetter
+	getter *reusingGetter
 }
 
 func NewPackageFetcher() *PackageFetcher {
 	return &PackageFetcher{
-		getter: reusingGetter{},
+		getter: newReusingGetter(),
 	}
 }
 

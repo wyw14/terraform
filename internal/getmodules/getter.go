@@ -8,10 +8,11 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync"
 
-	cleanhttp "github.com/hashicorp/go-cleanhttp"
 	getter "github.com/hashicorp/go-getter"
 	"github.com/hashicorp/terraform/internal/copy"
+	"github.com/hashicorp/terraform/internal/httpclient"
 )
 
 // We configure our own go-getter getter set here, because the set of sources
@@ -61,43 +62,103 @@ var goGetterDecompressors = map[string]getter.Decompressor{
 	"zip": new(getter.ZipDecompressor),
 }
 
-var goGetterGetters = map[string]getter.Getter{
-	// Protocol-based getters
-	"http":  getterHTTPGetter,
-	"https": getterHTTPGetter,
+// newGoGetterGetters constructs a fresh set of getters for use by a single
+// go-getter Client.
+//
+// go-getter mutates every getter it uses by writing a back-pointer to the
+// owning Client through Getter.SetClient while the Client is configured. The
+// getter instances in go-getter's own default set are therefore not safe to
+// share between concurrent Client.Get calls, such as several module packages
+// downloading at once, because the racing back-pointers would make each
+// download try to use another download's Client. We return brand-new getter
+// instances here for every fetch to avoid that data race.
+//
+// The HTTP and HTTPS getters still share getterHTTPClient, which is a single
+// concurrency-safe http.Client whose transport and connection pool are safe
+// for concurrent use.
+func newGoGetterGetters() map[string]getter.Getter {
+	return map[string]getter.Getter{
+		// Protocol-based getters
+		"http": &getter.HttpGetter{
+			Client:             getterHTTPClient,
+			Netrc:              true,
+			XTerraformGetLimit: 10,
+		},
+		"https": &getter.HttpGetter{
+			Client:             getterHTTPClient,
+			Netrc:              true,
+			XTerraformGetLimit: 10,
+		},
 
-	// Cloud storage getters
-	"gcs": new(getter.GCSGetter),
-	"s3":  new(getter.S3Getter),
+		// Cloud storage getters
+		"gcs": new(getter.GCSGetter),
+		"s3":  new(getter.S3Getter),
 
-	// Version control getters
-	"git": new(getter.GitGetter),
-	"hg":  new(getter.HgGetter),
+		// Version control getters
+		"git": new(getter.GitGetter),
+		"hg":  new(getter.HgGetter),
 
-	// Local and file-based getters
-	"file": new(getter.FileGetter),
+		// Local and file-based getters
+		"file": new(getter.FileGetter),
+	}
 }
 
-var getterHTTPClient = cleanhttp.DefaultClient()
-
-var getterHTTPGetter = &getter.HttpGetter{
-	Client:             getterHTTPClient,
-	Netrc:              true,
-	XTerraformGetLimit: 10,
-}
+// getterHTTPClient is the HTTP client used by go-getter for module packages
+// fetched over HTTP or HTTPS (including download locations returned by a
+// module registry). We use Terraform's standard HTTP client here so that module
+// downloads behave consistently with every other outbound request Terraform
+// makes:
+//   - proxy configuration from the HTTP_PROXY, HTTPS_PROXY and NO_PROXY
+//     environment variables is honored (via http.ProxyFromEnvironment),
+//   - the Terraform user-agent string is sent, and
+//   - idle connections are pooled, which avoids a fresh TCP/TLS handshake for
+//     every request and allows several packages to be downloaded concurrently
+//     without exhausting ephemeral ports.
+var getterHTTPClient = httpclient.New()
 
 // A reusingGetter is a helper for the module installer that remembers
 // the final resolved addresses of all of the sources it has already been
 // asked to install, and will copy from a prior installation directory if
 // it has the same resolved source address.
 //
-// The keys in a reusingGetter are the normalized (post-detection) package
+// The keys in the packages map are the normalized (post-detection) package
 // addresses, and the values are the paths where each source was previously
 // installed. (Users of this map should treat the keys as addrs.ModulePackage
 // values, but we can't type them that way because the addrs package
 // imports getmodules in order to indirectly access our go-getter
 // configuration.)
-type reusingGetter map[string]string
+//
+// A reusingGetter is safe for concurrent use. The package directory map is
+// guarded by a mutex so that the same PackageFetcher can be shared between
+// goroutines downloading independent module packages concurrently.
+type reusingGetter struct {
+	mu       sync.Mutex
+	packages map[string]string
+}
+
+func newReusingGetter() *reusingGetter {
+	return &reusingGetter{
+		packages: make(map[string]string),
+	}
+}
+
+// previousInstallDir returns the directory into which packageAddr was
+// previously fetched, if the reusingGetter has already seen it.
+func (g *reusingGetter) previousInstallDir(packageAddr string) (string, bool) {
+	g.mu.Lock()
+	dir, ok := g.packages[packageAddr]
+	g.mu.Unlock()
+	return dir, ok
+}
+
+// rememberInstallDir records that packageAddr was successfully fetched into
+// dir. Only successfully-fetched packages are remembered, so a failed fetch
+// can never leave a stale entry pointing at a partial directory.
+func (g *reusingGetter) rememberInstallDir(packageAddr, dir string) {
+	g.mu.Lock()
+	g.packages[packageAddr] = dir
+	g.mu.Unlock()
+}
 
 // getWithGoGetter fetches the package at the given address into the given
 // target directory. The given address must already be in normalized form
@@ -119,10 +180,10 @@ type reusingGetter map[string]string
 // end-user-actionable error messages. At this time we do not have any
 // reasonable way to improve these error messages at this layer because
 // the underlying errors are not separately recognizable.
-func (g reusingGetter) getWithGoGetter(ctx context.Context, instPath, packageAddr string) error {
+func (g *reusingGetter) getWithGoGetter(ctx context.Context, instPath, packageAddr string) error {
 	var err error
 
-	if prevDir, exists := g[packageAddr]; exists {
+	if prevDir, exists := g.previousInstallDir(packageAddr); exists {
 		log.Printf("[TRACE] getmodules: copying previous install of %q from %s to %s", packageAddr, prevDir, instPath)
 		err := os.Mkdir(instPath, os.ModePerm)
 		if err != nil {
@@ -143,8 +204,10 @@ func (g reusingGetter) getWithGoGetter(ctx context.Context, instPath, packageAdd
 
 			Detectors:     goGetterNoDetectors, // our caller should've already done detection
 			Decompressors: goGetterDecompressors,
-			Getters:       goGetterGetters,
-			Ctx:           ctx,
+			// A fresh set of getters per client keeps concurrent downloads
+			// from racing on go-getter's per-client back-pointers.
+			Getters: newGoGetterGetters(),
+			Ctx:     ctx,
 		}
 		err = client.Get()
 		if err != nil {
@@ -152,7 +215,7 @@ func (g reusingGetter) getWithGoGetter(ctx context.Context, instPath, packageAdd
 		}
 		// Remember where we installed this so we might reuse this directory
 		// on subsequent calls to avoid re-downloading.
-		g[packageAddr] = instPath
+		g.rememberInstallDir(packageAddr, instPath)
 	}
 
 	// If we get down here then we've either downloaded the package or

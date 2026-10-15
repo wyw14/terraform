@@ -12,6 +12,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/apparentlymart/go-versions/versions"
 	version "github.com/hashicorp/go-version"
@@ -45,6 +46,12 @@ type ModuleInstaller struct {
 	// addresses and the values are underlying remote source addresses.
 	registryPackageSources map[moduleVersion]addrs.ModuleSourceRemote
 
+	// registryCacheMu protects registryPackageVersions and
+	// registryPackageSources. Module installation can download independent
+	// modules concurrently, so the registry response caches must not be read
+	// and written from multiple goroutines without synchronization.
+	registryCacheMu sync.Mutex
+
 	initializer Initializer
 }
 
@@ -62,6 +69,45 @@ func NewModuleInstaller(modsDir string, loader *configload.Loader, reg *registry
 		registryPackageSources:  make(map[moduleVersion]addrs.ModuleSourceRemote),
 		initializer:             initializer,
 	}
+}
+
+// cachedRegistryPackageVersions returns a previously-obtained list of available
+// versions for the given package, if one has already been requested from the
+// registry during this installation.
+func (i *ModuleInstaller) cachedRegistryPackageVersions(pkg addrs.ModuleRegistryPackage) (*response.ModuleVersions, bool) {
+	i.registryCacheMu.Lock()
+	resp, ok := i.registryPackageVersions[pkg]
+	i.registryCacheMu.Unlock()
+	return resp, ok
+}
+
+// rememberRegistryPackageVersions records the available versions for the
+// given package so that concurrent or later installations of the same package
+// don't need to ask the registry again.
+func (i *ModuleInstaller) rememberRegistryPackageVersions(pkg addrs.ModuleRegistryPackage, resp *response.ModuleVersions) {
+	i.registryCacheMu.Lock()
+	i.registryPackageVersions[pkg] = resp
+	i.registryCacheMu.Unlock()
+}
+
+// cachedRegistryPackageSource returns the previously-resolved remote download
+// address for the given package version, if the registry has already been
+// asked for it during this installation.
+func (i *ModuleInstaller) cachedRegistryPackageSource(ver moduleVersion) (addrs.ModuleSourceRemote, bool) {
+	i.registryCacheMu.Lock()
+	src, ok := i.registryPackageSources[ver]
+	i.registryCacheMu.Unlock()
+	return src, ok
+}
+
+// rememberRegistryPackageSource records the remote download address returned
+// by the registry for the given package version. The registry is only asked
+// once for each package version, even when that package is installed more than
+// once concurrently.
+func (i *ModuleInstaller) rememberRegistryPackageSource(ver moduleVersion, src addrs.ModuleSourceRemote) {
+	i.registryCacheMu.Lock()
+	i.registryPackageSources[ver] = src
+	i.registryCacheMu.Unlock()
 }
 
 // InstallModules analyses the root module in the given directory and installs
@@ -420,7 +466,7 @@ func (i *ModuleInstaller) installRegistryModule(ctx context.Context, req *config
 	regsrcAddr := regsrc.ModuleFromRegistryPackageAddr(packageAddr)
 
 	// check if we've already looked up this module from the registry
-	if resp, exists = i.registryPackageVersions[packageAddr]; exists {
+	if resp, exists = i.cachedRegistryPackageVersions(packageAddr); exists {
 		log.Printf("[TRACE] %s using already found available versions of %s at %s", key, addr, hostname)
 	} else {
 		var err error
@@ -450,7 +496,7 @@ func (i *ModuleInstaller) installRegistryModule(ctx context.Context, req *config
 			}
 			return nil, nil, diags
 		}
-		i.registryPackageVersions[packageAddr] = resp
+		i.rememberRegistryPackageVersions(packageAddr, resp)
 	}
 
 	// The response might contain information about dependencies to allow us
@@ -587,7 +633,8 @@ func (i *ModuleInstaller) installRegistryModule(ctx context.Context, req *config
 
 	// first check the cache for the download URL
 	moduleAddr := moduleVersion{module: packageAddr, version: latestMatch.String()}
-	if _, exists := i.registryPackageSources[moduleAddr]; !exists {
+	dlAddr, cachedSource := i.cachedRegistryPackageSource(moduleAddr)
+	if !cachedSource {
 		realAddrRaw, err := reg.ModuleLocation(ctx, regsrcAddr, latestMatch.String())
 		if err != nil {
 			log.Printf("[ERROR] %s from %s %s: %s", key, addr, latestMatch, err)
@@ -613,7 +660,8 @@ func (i *ModuleInstaller) installRegistryModule(ctx context.Context, req *config
 		// its being called from) and we also don't allow recursively pointing
 		// at another registry source for simplicity's sake.
 		case addrs.ModuleSourceRemote:
-			i.registryPackageSources[moduleAddr] = realAddr
+			dlAddr = realAddr
+			i.rememberRegistryPackageSource(moduleAddr, realAddr)
 		default:
 			diags = diags.Append(&hcl.Diagnostic{
 				Severity: hcl.DiagError,
@@ -623,8 +671,6 @@ func (i *ModuleInstaller) installRegistryModule(ctx context.Context, req *config
 			return nil, nil, diags
 		}
 	}
-
-	dlAddr := i.registryPackageSources[moduleAddr]
 
 	log.Printf("[TRACE] ModuleInstaller: %s %s %s is available at %q", key, packageAddr, latestMatch, dlAddr.Package)
 

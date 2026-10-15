@@ -1,0 +1,3 @@
+kind: ENHANCEMENTS
+body: 'cli: Module package downloads over HTTP/HTTPS now reuse Terraform''s pooled HTTP client, so they send the Terraform user-agent and reuse connections while continuing to honor proxy configuration from the HTTP_PROXY, HTTPS_PROXY and NO_PROXY environment variables. The module package fetcher is also now safe to use when downloading multiple packages concurrently.'
+time: 2026-10-15T12:00:00.000000Z
