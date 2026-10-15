@@ -14,6 +14,7 @@ import (
 	"github.com/hashicorp/terraform/internal/configs"
 	"github.com/hashicorp/terraform/internal/configs/configschema"
 	"github.com/hashicorp/terraform/internal/instances"
+	"github.com/hashicorp/terraform/internal/lang/marks"
 	"github.com/hashicorp/terraform/internal/plans"
 	"github.com/hashicorp/terraform/internal/plans/deferring"
 	"github.com/hashicorp/terraform/internal/providers"
@@ -252,6 +253,88 @@ func TestNodeAbstractResourceInstance_refresh_with_deferred_read(t *testing.T) {
 
 	if deferred.Reason != providers.DeferredReasonAbsentPrereq {
 		t.Fatalf("expected deferral to be AbsentPrereq, got %s", deferred.Reason)
+	}
+}
+
+// haltPostRefreshHook halts when PostRefresh is invoked, emulating the stop
+// hook cancelling a run in the window after a read has returned.
+type haltPostRefreshHook struct {
+	NilHook
+}
+
+func (*haltPostRefreshHook) PostRefresh(id HookResourceIdentity, dk addrs.DeposedKey, priorState, newState cty.Value) (HookAction, error) {
+	return HookActionHalt, fmt.Errorf("execution halted")
+}
+
+// When the post-refresh hook halts (as happens if the run is cancelled right
+// after the provider read completes), refresh must not hand back the new,
+// still-unmarked object. Callers rely on the same contract as every other
+// refresh failure: the prior valid, correctly-marked object is returned.
+func TestNodeAbstractResourceInstance_refresh_with_halted_post_refresh(t *testing.T) {
+	state := states.NewState()
+	evalCtx := &MockEvalContext{}
+	evalCtx.StateState = state.SyncWrapper()
+	evalCtx.Scope = evalContextModuleInstance{Addr: addrs.RootModuleInstance}
+	evalCtx.HookHook = &haltPostRefreshHook{}
+
+	schema := &configschema.Block{
+		Attributes: map[string]*configschema.Attribute{
+			"id": {
+				Type:     cty.String,
+				Optional: true,
+			},
+			"secret": {
+				Type:      cty.String,
+				Optional:  true,
+				Sensitive: true,
+			},
+		},
+	}
+	mockProvider := mockProviderWithResourceTypeSchema("aws_instance", schema)
+	mockProvider.ConfigureProviderCalled = true
+	mockProvider.ReadResourceFn = func(providers.ReadResourceRequest) providers.ReadResourceResponse {
+		return providers.ReadResourceResponse{
+			NewState: cty.ObjectVal(map[string]cty.Value{
+				"id":     cty.StringVal("i-abc123"),
+				"secret": cty.StringVal("ROTATED"),
+			}),
+		}
+	}
+
+	prior := cty.ObjectVal(map[string]cty.Value{
+		"id":     cty.StringVal("i-abc123"),
+		"secret": cty.StringVal("shh"),
+	}).MarkWithPaths([]cty.PathValueMarks{
+		{
+			Path:  cty.Path{cty.GetAttrStep{Name: "secret"}},
+			Marks: cty.NewValueMarks(marks.Sensitive),
+		},
+	})
+
+	obj := &states.ResourceInstanceObject{
+		Value:  prior,
+		Status: states.ObjectReady,
+	}
+
+	node := &NodeAbstractResourceInstance{
+		Addr: mustResourceInstanceAddr("aws_instance.foo"),
+		NodeAbstractResource: NodeAbstractResource{
+			ResolvedProvider: mustProviderConfig(`provider["registry.terraform.io/hashicorp/aws"]`),
+		},
+	}
+	evalCtx.ProviderProvider = mockProvider
+	evalCtx.ProviderSchemaSchema = mockProvider.GetProviderSchema()
+
+	ret, _, diags := node.refresh(evalCtx, states.NotDeposed, obj, false)
+	if !diags.HasErrors() {
+		t.Fatal("expected the halt to be reported as diagnostics")
+	}
+
+	if !ret.Value.RawEquals(prior) {
+		t.Fatalf("the prior valid object must be retained when post-refresh halts, got %s", ret.Value.GoString())
+	}
+	if !ret.Value.GetAttr("secret").HasMark(marks.Sensitive) {
+		t.Fatal("the sensitive mark must not be stripped when post-refresh halts")
 	}
 }
 

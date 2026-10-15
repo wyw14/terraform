@@ -814,7 +814,14 @@ func (n *NodeAbstractResourceInstance) refresh(ctx EvalContext, deposedKey state
 		return h.PostRefresh(n.HookResourceIdentity(), deposedKey, priorVal, ret.Value)
 	}))
 	if diags.HasErrors() {
-		return ret, deferred, diags
+		// The refresh was interrupted (for example a hook halted the run in
+		// response to cancellation) after the provider had already returned a
+		// new value. The new value has not been committed to any state yet and
+		// its prior/schema marks (including sensitivity) have not yet been
+		// re-applied. Returning it here could let an unmarked, incomplete
+		// object replace the prior valid one, so keep the original state,
+		// matching all of the other failure paths above.
+		return state, deferred, diags
 	}
 
 	// Mark the value with any prior marks from the state, and the marks from
