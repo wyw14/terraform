@@ -6,8 +6,12 @@ package cloud
 import (
 	"context"
 	"log"
+	"strconv"
 	"sync/atomic"
 	"time"
+
+	"github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/terraform/internal/tracing"
 )
 
 // Fatal implements a RetryBackoff func return value that, if encountered,
@@ -41,7 +45,16 @@ var (
 // RetryBackoff retries function f until nil or a FatalError is returned.
 // RetryBackoff only returns an error if the context is in error or if a
 // FatalError was encountered.
-func RetryBackoff(ctx context.Context, f func() error) error {
+//
+// Every attempt runs under the same operation ID (taken from ctx) as the
+// surrounding operation and the retry loop as a whole, so retried work never
+// produces untraceable orphan records. The retry/backoff/cancellation
+// semantics are unchanged.
+func RetryBackoff(ctx context.Context, f func() error) (retErr error) {
+	// The retry span covers the whole loop, including the backoff waits.
+	retryCtx, endRetry := tracing.StartRetry(ctx, "cloud.RetryBackoff")
+	defer endRetry(&retErr)
+
 	// doneCh signals that the routine is done and sends the last error
 	var doneCh = make(chan struct{})
 	var errVal atomic.Value
@@ -54,6 +67,7 @@ func RetryBackoff(ctx context.Context, f func() error) error {
 		var delay time.Duration = 0
 		defer close(doneCh)
 
+		attempt := 0
 		for {
 			select {
 			case <-ctx.Done():
@@ -61,7 +75,16 @@ func RetryBackoff(ctx context.Context, f func() error) error {
 			case <-time.After(delay):
 			}
 
-			err := f()
+			attempt++
+			// Each attempt gets its own span, log records, and metrics, all
+			// attributed to the same operation ID as the loop itself.
+			var err error
+			func() {
+				_, endAttempt := tracing.StartAttempt(retryCtx, attempt)
+				defer endAttempt(&err)
+				err = f()
+			}()
+
 			switch e := err.(type) {
 			case nil:
 				return
@@ -78,6 +101,12 @@ func RetryBackoff(ctx context.Context, f func() error) error {
 			delay = min(delay, maxBackoffDelay)
 
 			log.Printf("[WARN] retryable error: %q, delaying for %s", err, delay)
+			tracing.RecordLog(retryCtx, hclog.Warn.String(), "retryable error",
+				tracing.StringAttr("retry.kind", "cloud.RetryBackoff"),
+				tracing.StringAttr("retry.attempt", strconv.Itoa(attempt)),
+				tracing.StringAttr("delay", delay.String()),
+				tracing.StringAttr("error", err.Error()),
+			)
 		}
 	}()
 

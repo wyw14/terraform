@@ -4,12 +4,14 @@
 package dag
 
 import (
+	"context"
 	"errors"
 	"log"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/hashicorp/terraform/internal/tracing"
 	"github.com/hashicorp/terraform/internal/tfdiags"
 )
 
@@ -30,6 +32,12 @@ import (
 type Walker struct {
 	// Callback is what is called for each vertex
 	Callback walkFunc
+
+	// ctx is carried into the goroutine spawned for each vertex so that
+	// asynchronous vertex visits keep the operation identity of the walk
+	// that started them. It may be nil, in which case vertex visits are
+	// untraced exactly as before.
+	ctx context.Context
 
 	// Only Start should modify these fields. Modifying them after the walk has
 	// started can cause serious problems.
@@ -62,6 +70,15 @@ func NewWalker(cb walkFunc, opts ...func(*Walker)) *Walker {
 	}
 
 	return w
+}
+
+// WalkerWithContext is a [NewWalker] option that propagates the given context
+// to the goroutine of every visited vertex, allowing per-vertex spans, logs,
+// and metrics to be attributed to the same operation ID as the walk itself.
+func WalkerWithContext(ctx context.Context) func(*Walker) {
+	return func(w *Walker) {
+		w.ctx = ctx
+	}
 }
 
 type walkerVertex struct {
@@ -251,6 +268,16 @@ func (w *Walker) walkVertex(v Vertex, info *walkerVertex) {
 	default:
 	}
 
+	// Each vertex runs in its own goroutine, but when the walk was started
+	// with a context we still open its visit span under the walk's operation
+	// ID, so concurrent (and skipped) vertices remain attributable to the
+	// one operation that owns the walk.
+	var vertexErr error
+	if w.ctx != nil {
+		_, endVertex := tracing.StartVertex(w.ctx, v.Name())
+		defer endVertex(&vertexErr)
+	}
+
 	// Run our callback or note that our upstream failed
 	var diags tfdiags.Diagnostics
 	var upstreamFailed bool
@@ -264,6 +291,7 @@ func (w *Walker) walkVertex(v Vertex, info *walkerVertex) {
 		diags = diags.Append(errors.New("upstream dependencies failed"))
 		upstreamFailed = true
 	}
+	vertexErr = diags.Err()
 
 	// Record the result (we must do this after execution because we mustn't
 	// hold diagsLock while visiting a vertex.)

@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"sync"
 
+	"github.com/hashicorp/go-hclog"
 	"github.com/zclconf/go-cty/cty"
 
 	"github.com/hashicorp/terraform/internal/addrs"
@@ -22,6 +23,7 @@ import (
 	"github.com/hashicorp/terraform/internal/provisioners"
 	"github.com/hashicorp/terraform/internal/states"
 	"github.com/hashicorp/terraform/internal/tfdiags"
+	"github.com/hashicorp/terraform/internal/tracing"
 )
 
 // InputMode defines what sort of input will be asked for when Input
@@ -286,6 +288,14 @@ func (c *Context) acquireRun(phase string) func() {
 	}
 	c.runContext, c.runContextCancel = context.WithCancel(parent)
 
+	// Attribute this core run (plan/apply/validate/...) to the operation ID
+	// carried by the tracing context, so the run and its graph walk can be
+	// aggregated with the command that started them.
+	tracing.RecordLog(c.runContext, hclog.Info.String(), "core run started",
+		tracing.StringAttr("phase", phase))
+	tracing.IncrCounter(c.runContext, "core.run",
+		tracing.StringAttr("phase", phase))
+
 	// Reset the stop hook so we're not stopped
 	c.sh.Reset()
 
@@ -294,8 +304,16 @@ func (c *Context) acquireRun(phase string) func() {
 
 func (c *Context) releaseRun() {
 	// Grab the context lock so that we can make modifications to fields
+	// c.l.Lock()
 	c.l.Lock()
 	defer c.l.Unlock()
+
+	// Record the end of the run against the same operation as its start,
+	// while the run context still exists. Stop() may have run first, in
+	// which case there is nothing left to attribute.
+	if c.runContext != nil {
+		tracing.RecordLog(c.runContext, hclog.Info.String(), "core run finished")
+	}
 
 	// End our run. We check if runContext is non-nil because it can be
 	// set to nil if it was cancelled via Stop()

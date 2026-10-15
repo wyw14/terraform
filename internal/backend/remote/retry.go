@@ -6,8 +6,12 @@ package remote
 import (
 	"context"
 	"log"
+	"strconv"
 	"sync/atomic"
 	"time"
+
+	"github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/terraform/internal/tracing"
 )
 
 // Fatal implements a RetryBackoff func return value that, if encountered,
@@ -41,7 +45,14 @@ var (
 // RetryBackoff retries function f until nil or a FatalError is returned.
 // RetryBackoff only returns an error if the context is in error or if a
 // FatalError was encountered.
-func RetryBackoff(ctx context.Context, f func() error) error {
+//
+// The whole loop and each attempt share the operation ID carried by ctx, so
+// retried work stays attributable to the operation that started it. The
+// retry/backoff/cancellation semantics are unchanged.
+func RetryBackoff(ctx context.Context, f func() error) (retErr error) {
+	retryCtx, endRetry := tracing.StartRetry(ctx, "remote.RetryBackoff")
+	defer endRetry(&retErr)
+
 	// doneCh signals that the routine is done and sends the last error
 	var doneCh = make(chan struct{})
 	var errVal atomic.Value
@@ -54,6 +65,7 @@ func RetryBackoff(ctx context.Context, f func() error) error {
 		var delay time.Duration = 0
 		defer close(doneCh)
 
+		attempt := 0
 		for {
 			select {
 			case <-ctx.Done():
@@ -61,7 +73,14 @@ func RetryBackoff(ctx context.Context, f func() error) error {
 			case <-time.After(delay):
 			}
 
-			err := f()
+			attempt++
+			var err error
+			func() {
+				_, endAttempt := tracing.StartAttempt(retryCtx, attempt)
+				defer endAttempt(&err)
+				err = f()
+			}()
+
 			switch e := err.(type) {
 			case nil:
 				return
@@ -78,6 +97,12 @@ func RetryBackoff(ctx context.Context, f func() error) error {
 			delay = min(delay, maxBackoffDelay)
 
 			log.Printf("[WARN] retryable error: %q, delaying for %s", err, delay)
+			tracing.RecordLog(retryCtx, hclog.Warn.String(), "retryable error",
+				tracing.StringAttr("retry.kind", "remote.RetryBackoff"),
+				tracing.StringAttr("retry.attempt", strconv.Itoa(attempt)),
+				tracing.StringAttr("delay", delay.String()),
+				tracing.StringAttr("error", err.Error()),
+			)
 		}
 	}()
 

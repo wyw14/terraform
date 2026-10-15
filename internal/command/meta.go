@@ -44,6 +44,7 @@ import (
 	"github.com/hashicorp/terraform/internal/terminal"
 	"github.com/hashicorp/terraform/internal/terraform"
 	"github.com/hashicorp/terraform/internal/tfdiags"
+	"github.com/hashicorp/terraform/internal/tracing"
 )
 
 // Meta are the meta-options that are available on all or most commands.
@@ -514,7 +515,13 @@ func (m *Meta) CommandContext() context.Context {
 // If the operation runs to completion then no error is returned even if the
 // operation itself is unsuccessful. Use the "Result" field of the
 // returned operation object to recognize operation-level failure.
-func (m *Meta) RunOperation(b backendrun.OperationsBackend, opReq *backendrun.Operation) (*backendrun.RunningOperation, error) {
+func (m *Meta) RunOperation(b backendrun.OperationsBackend, opReq *backendrun.Operation) (retOp *backendrun.RunningOperation, retErr error) {
+	// Mark the command-to-backend handoff as one synchronous stage of the
+	// command's operation, so the backend work joins the same operation ID
+	// as the rest of the command.
+	ctx, endStage := tracing.Stage(m.CommandContext(), "command.RunOperation")
+	defer endStage(&retErr)
+
 	if opReq.View == nil {
 		panic("RunOperation called with nil View")
 	}
@@ -522,7 +529,7 @@ func (m *Meta) RunOperation(b backendrun.OperationsBackend, opReq *backendrun.Op
 		opReq.ConfigDir = m.normalizePath(opReq.ConfigDir)
 	}
 
-	op, err := b.Operation(m.CommandContext(), opReq)
+	op, err := b.Operation(ctx, opReq)
 	if err != nil {
 		return nil, fmt.Errorf("error starting operation: %s", err)
 	}

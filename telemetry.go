@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/hashicorp/terraform/internal/tracing"
 	"github.com/hashicorp/terraform/version"
 	"go.opentelemetry.io/contrib/exporters/autoexport"
 	"go.opentelemetry.io/otel"
@@ -78,7 +79,14 @@ func openTelemetryInit() error {
 		return err
 	}
 	sp := sdktrace.NewSimpleSpanProcessor(exp)
+
+	// The sampling ratio (TF_TRACE_SAMPLE_RATE) is decided once per
+	// operation at the root and inherited by all child spans through the
+	// parent-based sampler, so synchronous, asynchronous, and retried paths
+	// all agree about whether an operation is sampled.
+	sampler := sdktrace.ParentBased(sdktrace.TraceIDRatioBased(tracing.SampleRate()))
 	provider := sdktrace.NewTracerProvider(
+		sdktrace.WithSampler(sampler),
 		sdktrace.WithSpanProcessor(sp),
 		sdktrace.WithResource(otelResource),
 	)
@@ -86,6 +94,10 @@ func openTelemetryInit() error {
 
 	pgtr := propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{})
 	otel.SetTextMapPropagator(pgtr)
+
+	// Export being active unlocks the operation-ID enrichment of the
+	// process-wide logger; nothing else changes behavior based on this.
+	tracing.SetTelemetryEnabled(true)
 
 	return nil
 }

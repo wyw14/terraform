@@ -4,6 +4,7 @@
 package dag
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"slices"
@@ -269,6 +270,14 @@ func (g *AcyclicGraph) Cycles() [][]Vertex {
 // problems from all graphs visited, in no particular order.
 func (g *AcyclicGraph) Walk(cb walkFunc) tfdiags.Diagnostics {
 	w := NewWalker(cb)
+	return w.Walk(g)
+}
+
+// WalkWithContext is like [AcyclicGraph.Walk] but carries ctx into the
+// goroutine of every visited vertex, so each vertex's tracing span, logs, and
+// metrics join the same operation as the rest of the walk.
+func (g *AcyclicGraph) WalkWithContext(ctx context.Context, cb walkFunc) tfdiags.Diagnostics {
+	w := NewWalker(cb, WalkerWithContext(ctx))
 	return w.Walk(g)
 }
 

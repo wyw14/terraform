@@ -7,6 +7,9 @@ import (
 	"context"
 	"sync/atomic"
 
+	"github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/terraform/internal/tracing"
+
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -76,15 +79,38 @@ func AsyncTask[P PromiseContainer](ctx context.Context, promises P, impl func(ct
 	// the causal relationship between the two using span links.
 	callerSpanContext := trace.SpanFromContext(ctx).SpanContext()
 
-	childCtx, childSpan := tracer.Start(
-		ctx, "async task",
+	// The trace parent/child relationship is deliberately cut, but the
+	// operation ID and the sampling decision travel as ordinary context
+	// values, so the detached task stays attributable to the same operation
+	// as its caller. We also stamp the ID onto the new root span itself.
+	spanOpts := []trace.SpanStartOption{
 		trace.WithNewRoot(),
 		trace.WithLinks(
 			trace.Link{
 				SpanContext: callerSpanContext,
 			},
 		),
+	}
+	if operationID, ok := tracing.OperationIDFromContext(ctx); ok {
+		spanOpts = append(spanOpts, trace.WithAttributes(
+			attribute.String(tracing.OperationIDKey, string(operationID)),
+		))
+	}
+
+	childCtx, childSpan := tracer.Start(
+		ctx, "async task",
+		spanOpts...,
 	)
+	if operationID, ok := tracing.OperationIDFromContext(childCtx); ok {
+		tracing.RecordLog(childCtx, hclog.Debug.String(), "promising async task started",
+			tracing.StringAttr(tracing.OperationIDKey, string(operationID)),
+			tracing.StringAttr("promising.delegated_from", callerSpanContext.SpanID().String()),
+			tracing.StringAttr("promising.delegated_to", childSpan.SpanContext().SpanID().String()),
+		)
+		tracing.IncrCounter(childCtx, "promising.async_task",
+			tracing.StringAttr(tracing.OperationIDKey, string(operationID)),
+		)
+	}
 
 	promises.AnnounceContainedPromises(func(apr AnyPromiseResolver) {
 		p := apr.promise()

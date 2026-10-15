@@ -24,10 +24,10 @@ import (
 	"github.com/hashicorp/terraform/internal/httpclient"
 	"github.com/hashicorp/terraform/internal/logging"
 	"github.com/hashicorp/terraform/internal/terminal"
+	"github.com/hashicorp/terraform/internal/tracing"
 	"github.com/hashicorp/terraform/version"
 	"github.com/mattn/go-shellwords"
 	"github.com/mitchellh/colorstring"
-	"go.opentelemetry.io/otel/trace"
 
 	backendInit "github.com/hashicorp/terraform/internal/backend/init"
 )
@@ -62,21 +62,27 @@ func realMain() int {
 	err = openTelemetryInit()
 	if err != nil {
 		// openTelemetryInit can only fail if Terraform was run with an
-		// explicit environment variable to enable telemetry collection,
-		// so in typical use we cannot get here.
-		Ui.Error(fmt.Sprintf("Could not initialize telemetry: %s", err))
+		// explicit environment variable to enable telemetry collection, so
+		// in typical use we cannot get here.
+		//
+		// Telemetry is strictly best-effort and must never change the
+		// outcome of a command: rather than aborting, we warn and continue
+		// with the no-op tracer provider. Operation-ID correlation and the
+		// in-process log/metric aggregates still work.
+		Ui.Error(fmt.Sprintf("Could not initialize telemetry, continuing without telemetry export: %s", err))
 		Ui.Error(fmt.Sprintf("Unset environment variable %s if you don't intend to collect telemetry from Terraform.", openTelemetryExporterEnvVar))
-		return 1
 	}
 	var ctx context.Context
-	var otelSpan trace.Span
+	var endOperation tracing.EndFunc
 	{
-		// At minimum we emit a span covering the entire command execution.
+		// At minimum we emit a span covering the entire command execution,
+		// and we assign the operation ID that every synchronous stage,
+		// asynchronous task, and retry attempt will be attributed to.
 		_, displayArgs := shquot.POSIXShellSplit(os.Args)
 		// Extract the parent traces from the environment if present.
 		parentCtx := extractParentTraceContext(context.Background())
-		ctx, otelSpan = tracer.Start(parentCtx, fmt.Sprintf("terraform %s", displayArgs))
-		defer otelSpan.End()
+		ctx, _, endOperation = tracing.StartOperation(parentCtx, fmt.Sprintf("terraform %s", displayArgs))
+		defer endOperation(nil)
 	}
 
 	tmpLogPath := os.Getenv(envTmpLogPath)
@@ -241,8 +247,12 @@ func realMain() int {
 		initCommands(ctx, originalWd, streams, config, services, providerSrc, providerDevOverrides, unmanagedProviders)
 	}
 
-	// Run checkpoint
-	go runCheckpoint(ctx, config)
+	// Run checkpoint. The helper starts a detached async span linked back to
+	// the command's operation, so the checkpoint goroutine keeps the same
+	// operation ID as the rest of the command.
+	tracing.Go(ctx, "checkpoint", func(ctx context.Context) {
+		runCheckpoint(ctx, config)
+	})
 
 	// Make sure we clean up any managed plugins at the end of this
 	defer plugin.CleanupClients()

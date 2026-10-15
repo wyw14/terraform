@@ -8,15 +8,18 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/terraform/internal/communicator/remote"
 	"github.com/hashicorp/terraform/internal/communicator/shared"
 	"github.com/hashicorp/terraform/internal/communicator/ssh"
 	"github.com/hashicorp/terraform/internal/communicator/winrm"
 	"github.com/hashicorp/terraform/internal/provisioners"
+	"github.com/hashicorp/terraform/internal/tracing"
 	"github.com/zclconf/go-cty/cty"
 )
 
@@ -86,7 +89,14 @@ type Fatal interface {
 
 // Retry retries the function f until it returns a nil error, a Fatal error, or
 // the context expires.
-func Retry(ctx context.Context, f func() error) error {
+//
+// The loop and every attempt share the operation ID carried by ctx, so
+// connection retries stay attributable to the operation performing them. The
+// backoff and interruption/timeout semantics are unchanged.
+func Retry(ctx context.Context, f func() error) (retErr error) {
+	retryCtx, endRetry := tracing.StartRetry(ctx, "communicator.Retry")
+	defer endRetry(&retErr)
+
 	// container for atomic error value
 	type errWrap struct {
 		E error
@@ -103,6 +113,7 @@ func Retry(ctx context.Context, f func() error) error {
 		defer close(doneCh)
 
 		delay := time.Duration(0)
+		attempt := 0
 		for {
 			// If our context ended, we want to exit right away.
 			select {
@@ -111,8 +122,16 @@ func Retry(ctx context.Context, f func() error) error {
 			case <-time.After(delay):
 			}
 
-			// Try the function call
-			err := f()
+			// Try the function call within a per-attempt span. The attempt
+			// span is always ended (success, failure, or panic) before the
+			// loop continues, so a canceled retry leaves no open records.
+			attempt++
+			var err error
+			func() {
+				_, endAttempt := tracing.StartAttempt(retryCtx, attempt)
+				defer endAttempt(&err)
+				err = f()
+			}()
 
 			// return if we have no error, or a FatalError
 			done := false
@@ -131,6 +150,11 @@ func Retry(ctx context.Context, f func() error) error {
 			}
 
 			log.Printf("[WARN] retryable error: %v", err)
+			tracing.RecordLog(retryCtx, hclog.Warn.String(), "retryable error",
+				tracing.StringAttr("retry.kind", "communicator.Retry"),
+				tracing.StringAttr("retry.attempt", strconv.Itoa(attempt)),
+				tracing.StringAttr("error", err.Error()),
+			)
 
 			delay *= 2
 
@@ -143,6 +167,11 @@ func Retry(ctx context.Context, f func() error) error {
 			}
 
 			log.Printf("[INFO] sleeping for %s", delay)
+			tracing.RecordLog(retryCtx, hclog.Info.String(), "sleeping between retries",
+				tracing.StringAttr("retry.kind", "communicator.Retry"),
+				tracing.StringAttr("retry.attempt", strconv.Itoa(attempt)),
+				tracing.StringAttr("delay", delay.String()),
+			)
 		}
 	}()
 

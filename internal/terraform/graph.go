@@ -4,6 +4,7 @@
 package terraform
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"strings"
@@ -184,7 +185,16 @@ func (g *Graph) walk(walker GraphWalker) tfdiags.Diagnostics {
 		return
 	}
 
-	return g.AcyclicGraph.Walk(walkFn)
+	// Resolve the run context (which carries the operation ID handed down
+	// from the command through the backend) for the walk, so each vertex
+	// goroutine is attributed to the same operation. Walkers without a
+	// context, such as the null walker used in some tests, simply walk
+	// without correlation.
+	walkCtx := context.Background()
+	if cw, ok := walker.(*ContextGraphWalker); ok && cw.StopContext != nil {
+		walkCtx = cw.StopContext
+	}
+	return g.AcyclicGraph.WalkWithContext(walkCtx, walkFn)
 }
 
 // ResourceGraph derives a graph containing addresses of only the nodes in the

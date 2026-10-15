@@ -27,6 +27,7 @@ import (
 	"github.com/hashicorp/terraform/internal/resources/ephemeral"
 	"github.com/hashicorp/terraform/internal/states"
 	"github.com/hashicorp/terraform/internal/tfdiags"
+	"github.com/hashicorp/terraform/internal/tracing"
 )
 
 // graphWalkOpts captures some transient values we use (and possibly mutate)
@@ -100,6 +101,15 @@ func (c *Context) walk(graph *Graph, operation walkOperation, opts *graphWalkOpt
 	log.Printf("[DEBUG] Starting graph walk: %s", operation)
 
 	walker := c.graphWalker(graph, operation, opts)
+
+	// The graph walk is the asynchronous heart of the operation: the DAG
+	// spawns a goroutine per vertex. Mark it as a stage under the run
+	// context so the walk and all of its vertices join the command's
+	// operation ID. c.runContext is nil in some unit-test entry points;
+	// tracing accepts a nil context and treats that as uncorrelated.
+	_, endWalkStage := tracing.Stage(c.runContext, "terraform.graphWalk",
+		tracing.StringAttr("operation", string(operation)))
+	defer endWalkStage(nil)
 
 	// Watch for a stop so we can call the provider Stop() API.
 	watchStop, watchWait := c.watchStop(walker)

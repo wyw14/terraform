@@ -25,6 +25,7 @@ import (
 	"github.com/hashicorp/terraform/internal/states/statemgr"
 	"github.com/hashicorp/terraform/internal/terraform"
 	"github.com/hashicorp/terraform/internal/tfdiags"
+	"github.com/hashicorp/terraform/internal/tracing"
 )
 
 // backendrun.Local implementation.
@@ -39,7 +40,13 @@ func (b *Local) LocalRun(ctx context.Context, op *backendrun.Operation) (*backen
 
 	op.StateLocker = op.StateLocker.WithContext(ctx)
 
-	lr, _, stateMgr, diags := b.localRun(ctx, op)
+	// The local run is one stage of the command's operation, so the core
+	// context derived below keeps the same operation ID all the way down to
+	// the graph walk.
+	stageCtx, endStage := tracing.Stage(ctx, "backend.local.LocalRun")
+	defer endStage(nil)
+
+	lr, _, stateMgr, diags := b.localRun(stageCtx, op)
 	return lr, stateMgr, diags
 }
 

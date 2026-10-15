@@ -40,6 +40,7 @@ import (
 	"github.com/hashicorp/terraform/internal/states"
 	"github.com/hashicorp/terraform/internal/states/statefile"
 	"github.com/hashicorp/terraform/internal/tfdiags"
+	"github.com/hashicorp/terraform/internal/tracing"
 )
 
 type stacksServer struct {
@@ -1218,9 +1219,13 @@ func stackChangeHooks(send func(*stacks.StackChangeProgress) error, mainStackSou
 		// a root tracing span for all of the downstream planning operations to
 		// attach themselves to.
 		BeginPlan: func(ctx context.Context, s struct{}) any {
-			_, span := tracer.Start(ctx, "planning", trace.WithAttributes(
+			attrs := []attribute.KeyValue{
 				attribute.String("main_stack_source", mainStackSource.String()),
-			))
+			}
+			if operationID, ok := tracing.OperationIDFromContext(ctx); ok {
+				attrs = append(attrs, attribute.String(tracing.OperationIDKey, string(operationID)))
+			}
+			_, span := tracer.Start(ctx, "planning", trace.WithAttributes(attrs...))
 			return span
 		},
 		EndPlan: func(ctx context.Context, span any, s struct{}) any {
@@ -1233,9 +1238,13 @@ func stackChangeHooks(send func(*stacks.StackChangeProgress) error, mainStackSou
 		// a root tracing span for all of the downstream planning operations to
 		// attach themselves to.
 		BeginApply: func(ctx context.Context, s struct{}) any {
-			_, span := tracer.Start(ctx, "applying", trace.WithAttributes(
+			attrs := []attribute.KeyValue{
 				attribute.String("main_stack_source", mainStackSource.String()),
-			))
+			}
+			if operationID, ok := tracing.OperationIDFromContext(ctx); ok {
+				attrs = append(attrs, attribute.String(tracing.OperationIDKey, string(operationID)))
+			}
+			_, span := tracer.Start(ctx, "applying", trace.WithAttributes(attrs...))
 			return span
 		},
 		EndApply: func(ctx context.Context, span any, s struct{}) any {
